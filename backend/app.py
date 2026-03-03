@@ -1,145 +1,111 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from shazamio import Shazam
-import asyncio
-import os
-import logging
+#!/usr/bin/env python3
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+import json
+import httpx
+from datetime import datetime
+from acrcloud.recognizer import ACRCloudRecognizer
 
-app = Flask(__name__)
-CORS(app)
+app = FastAPI()
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-ANYTYPE_API_KEY = os.environ.get('ANYTYPE_API_KEY')
-ANYTYPE_SPACE_ID = os.environ.get('ANYTYPE_SPACE_ID', 'bafyreidsjaufkmqy2qbhxytumdfeijc4i5u37yqizbshdziuu6xuvg5rne')
-
-ANYTYPE_HEADERS = {
-    'Authorization': f'Bearer {ANYTYPE_API_KEY}',
-    'Content-Type': 'application/json'
+ACR_CONFIG = {
+    "host": "ap-southeast-1.api.acrcloud.com",
+    "access_key": "409edc00cbff342f0960a6e82d872028",
+    "access_secret": "3ETYsb5Aud9wZ2KoiFH2rZgk1ZYT2Fv9Xj42phnk",
+    "timeout": 10,
 }
 
-ANYTYPE_API_URL = 'https://api.anytype.io'
+ANYTYPE_API_KEY = "FwdYEb4HaiBYlUBiCjJsdo8cYbTGoWRibB3CdRctJTs="
+ANYTYPE_SPACE_ID = "bafyreidsjaufkmqy2qbhxytumdfeijc4i5u37yqizbshdziuu6xuvg5rne"
 
-async def save_to_anytype(song_data: dict, station_name: str):
-    """Guarda la canción en AnyType"""
-    import datetime
-    import aiohttp
-    
+acr = ACRCloudRecognizer(ACR_CONFIG)
+
+
+def get_apple_music_link(metadata: dict) -> str:
     try:
-        current_date = datetime.datetime.now().strftime('%Y-%m-%d')
-        
-        object_payload = {
-            "type": "song",
-            "name": f"{song_data.get('title', 'Unknown')} - {song_data.get('artist', 'Unknown')}",
-            "properties": {
-                "fecha": {"date": {"start": current_date}},
-                "estacion": station_name,
-                "cancion": song_data.get('title', ''),
-                "artista": song_data.get('artist', ''),
-                "album": song_data.get('album', ''),
-                "ano": song_data.get('year', 0),
-                "cover": song_data.get('cover', ''),
-                "appleMusic": song_data.get('apple_music', '')
-            }
+        if metadata.get("spotify"):
+            return metadata["spotify"].get("external_urls", {}).get("spotify", "")
+        if metadata.get("apple_music"):
+            return metadata["apple_music"].get("url", "")
+        return ""
+    except Exception:
+        return ""
+
+
+@app.post("/recognize")
+async def recognize_song(file: UploadFile = File(...)):
+    try:
+        audio_data = await file.read()
+        result = acr.recognize_by_filebuffer(audio_data, 0)
+
+        if result["status"]["code"] != 0:
+            return {"success": False, "message": "No song recognized"}
+
+        metadata = result["metadata"]["music"][0]
+
+        song_info = {
+            "title": metadata.get("title", "Unknown"),
+            "artist": metadata.get("artists", [{}])[0].get("name", "Unknown"),
+            "album": metadata.get("album", {}).get("name", ""),
+            "year": metadata.get("release_date", "")[:4] if metadata.get("release_date") else "",
+            "cover_url": metadata.get("album", {}).get("images", [{}])[0].get("url", ""),
+            "apple_music_link": get_apple_music_link(metadata),
         }
-        
-        async with aiohttp.ClientSession() as session:
-            url = f"{ANYTYPE_API_URL}/v1/spaces/{ANYTYPE_SPACE_ID}/objects"
-            async with session.post(url, json=object_payload, headers=ANYTYPE_HEADERS) as resp:
-                if resp.status in [200, 201]:
-                    logger.info(f"Canción guardada en AnyType: {song_data.get('title')}")
-                    return True
-                else:
-                    logger.error(f"Error guardando en AnyType: {resp.status}")
-                    return False
-    except Exception as e:
-        logger.error(f"Error en save_to_anytype: {e}")
-        return False
 
-async def identify_song(audio_path: str, station_name: str):
-    """Identifica la canción usando ShazamIO 0.8+"""
+        return {"success": True, "song": song_info}
+
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
+@app.post("/save-to-anytype")
+async def save_to_anytype(data: dict):
     try:
-        shazam = Shazam()
-        out = await shazam.recognize(audio_path)
-        
-        if out and 'track' in out:
-            track = out['track']
-            
-            song_data = {
-                'title': track.get('title', 'Unknown'),
-                'artist': track.get('subtitle', 'Unknown'),
-                'album': '',
-                'cover': '',
-                'apple_music': '',
-                'year': 0
-            }
-            
-            # Cover
-            if 'images' in track:
-                song_data['cover'] = track['images'].get('coverart', '')
-            
-            # Apple Music / Spotify
-            if 'hub' in track:
-                hub = track['hub']
-                if 'options' in hub:
-                    for option in hub['options']:
-                        if 'actions' in option:
-                            for action in option['actions']:
-                                uri = action.get('uri', '')
-                                if 'apple' in uri.lower():
-                                    song_data['apple_music'] = uri
-                                elif 'spotify' in uri.lower():
-                                    song_data['spotify'] = uri
-            
-            # Año
-            if 'sections' in track:
-                for section in track['sections']:
-                    if 'metadata' in section:
-                        for meta in section['metadata']:
-                            if meta.get('caption') == 'Released':
-                                try:
-                                    year = meta.get('text', '').split('-')[0]
-                                    song_data['year'] = int(year)
-                                except:
-                                    pass
-            
-            # Guardar en AnyType
-            await save_to_anytype(song_data, station_name)
-            
-            return song_data
+        song = data.get("song", {})
+        station = data.get("station", "Unknown")
+
+        payload = {
+            "name": f"{song.get('title', 'Unknown')} - {song.get('artist', 'Unknown')}",
+            "icon": "🎵",
+            "type_key": "canci\u00f3n",
+            "properties": {
+                "date": datetime.now().isoformat(),
+                "station": station,
+                "song": song.get("title", ""),
+                "artist": song.get("artist", ""),
+                "album": song.get("album", ""),
+                "year": song.get("year", ""),
+                "cover": song.get("cover_url", ""),
+                "appleMusicLink": song.get("apple_music_link", ""),
+            },
+        }
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"http://localhost:31009/v1/spaces/{ANYTYPE_SPACE_ID}/objects",
+                headers={
+                    "Authorization": f"Bearer {ANYTYPE_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+
+        if response.status_code in (200, 201):
+            return {"success": True}
         else:
-            return None
-            
+            return {"success": False, "message": response.text}
+
     except Exception as e:
-        logger.error(f"Error identificando canción: {e}")
-        return None
+        return {"success": False, "message": str(e)}
 
-@app.route('/identify', methods=['POST'])
-def identify_endpoint():
-    """Endpoint para identificar canción"""
-    if 'file' not in request.files:
-        return jsonify({'error': 'No audio file provided'}), 400
-    
-    audio_file = request.files['file']
-    station_name = request.form.get('station', 'Unknown')
-    
-    temp_path = '/tmp/audio.wav'
-    audio_file.save(temp_path)
-    
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    result = loop.run_until_complete(identify_song(temp_path, station_name))
-    loop.close()
-    
-    if result:
-        return jsonify(result)
-    else:
-        return jsonify({'error': 'Could not identify song'}), 404
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    return jsonify({'status': 'ok'})
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
