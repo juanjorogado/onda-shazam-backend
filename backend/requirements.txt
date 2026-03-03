@@ -1,6 +1,6 @@
 flask==3.0.0
 flask-cors==4.0.0
-ShazamIO==0.8.1
+shazamio==0.8.1
 aiohttp==3.9.1
 python-dotenv==1.0.0
 gunicorn==21.2.0

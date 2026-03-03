@@ -1,7 +1,6 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import ShazamIO
-import aiohttp
+from shazamio import Shazam
 import asyncio
 import os
 import logging
@@ -13,7 +12,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 ANYTYPE_API_KEY = os.environ.get('ANYTYPE_API_KEY')
-ANYTYPE_SPACE_ID = os.environ.get('ANYTYPE_SPACE_ID', 'bafyreidsjaufkmqy2qbhxytumdfefeijc4i5u37yqizbshdziuu6xuvg5rne')
+ANYTYPE_SPACE_ID = os.environ.get('ANYTYPE_SPACE_ID', 'bafyreidsjaufkmqy2qbhxytumdfeijc4i5u37yqizbshdziuu6xuvg5rne')
 
 ANYTYPE_HEADERS = {
     'Authorization': f'Bearer {ANYTYPE_API_KEY}',
@@ -24,18 +23,17 @@ ANYTYPE_API_URL = 'https://api.anytype.io'
 
 async def save_to_anytype(song_data: dict, station_name: str):
     """Guarda la canción en AnyType"""
+    import datetime
+    import aiohttp
+    
     try:
-        # Obtener fecha actual
-        import datetime
         current_date = datetime.datetime.now().strftime('%Y-%m-%d')
         
-        # Preparar el objeto para AnyType
-        # Nota: Necesitas crear un tipo "Canción" en AnyType primero
         object_payload = {
-            "type": "song",  # Esto dependerá del type_key de tu objeto en AnyType
+            "type": "song",
             "name": f"{song_data.get('title', 'Unknown')} - {song_data.get('artist', 'Unknown')}",
             "properties": {
-                "fecha": current_date,
+                "fecha": {"date": {"start": current_date}},
                 "estacion": station_name,
                 "cancion": song_data.get('title', ''),
                 "artista": song_data.get('artist', ''),
@@ -49,7 +47,7 @@ async def save_to_anytype(song_data: dict, station_name: str):
         async with aiohttp.ClientSession() as session:
             url = f"{ANYTYPE_API_URL}/v1/spaces/{ANYTYPE_SPACE_ID}/objects"
             async with session.post(url, json=object_payload, headers=ANYTYPE_HEADERS) as resp:
-                if resp.status == 200:
+                if resp.status in [200, 201]:
                     logger.info(f"Canción guardada en AnyType: {song_data.get('title')}")
                     return True
                 else:
@@ -60,43 +58,41 @@ async def save_to_anytype(song_data: dict, station_name: str):
         return False
 
 async def identify_song(audio_path: str, station_name: str):
-    """Identifica la canción usando ShazamIO"""
-    shazam = ShazamIO.ShazamIO()
-    
+    """Identifica la canción usando ShazamIO 0.8+"""
     try:
-        out = await shazam.recognize_song(audio_path)
+        shazam = Shazam()
+        out = await shazam.recognize(audio_path)
         
-        if out and len(out) > 0:
-            track = out[0]
+        if out and 'track' in out:
+            track = out['track']
             
-            # Extraer datos del track
             song_data = {
                 'title': track.get('title', 'Unknown'),
                 'artist': track.get('subtitle', 'Unknown'),
-                'album': track.get('sectionMetadata', {}).get('caption', ''),
+                'album': '',
                 'cover': '',
                 'apple_music': '',
                 'year': 0
             }
             
-            # Obtener cover de imágenes
+            # Cover
             if 'images' in track:
                 song_data['cover'] = track['images'].get('coverart', '')
             
-            # Obtener enlaces de Apple Music / Spotify
+            # Apple Music / Spotify
             if 'hub' in track:
                 hub = track['hub']
                 if 'options' in hub:
                     for option in hub['options']:
                         if 'actions' in option:
                             for action in option['actions']:
-                                if action.get('type') == 'appleMusicopen':
-                                    song_data['apple_music'] = action.get('uri', '')
-                                    break
-                                elif action.get('type') == 'spotifyopen':
-                                    song_data['spotify'] = action.get('uri', '')
+                                uri = action.get('uri', '')
+                                if 'apple' in uri.lower():
+                                    song_data['apple_music'] = uri
+                                elif 'spotify' in uri.lower():
+                                    song_data['spotify'] = uri
             
-            # Extraer año de release date
+            # Año
             if 'sections' in track:
                 for section in track['sections']:
                     if 'metadata' in section:
@@ -128,11 +124,9 @@ def identify_endpoint():
     audio_file = request.files['file']
     station_name = request.form.get('station', 'Unknown')
     
-    # Guardar archivo temporalmente
     temp_path = '/tmp/audio.wav'
     audio_file.save(temp_path)
     
-    # Ejecutar identificación
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     result = loop.run_until_complete(identify_song(temp_path, station_name))
@@ -145,7 +139,6 @@ def identify_endpoint():
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    """Health check endpoint"""
     return jsonify({'status': 'ok'})
 
 if __name__ == '__main__':
