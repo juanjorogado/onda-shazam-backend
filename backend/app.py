@@ -7,7 +7,6 @@ import json
 import httpx
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional
 
 app = FastAPI()
 
@@ -18,8 +17,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Tu host original era ap-southeast-1, lo uso aquí
 ACR_CONFIG = {
-    "host": "identify-eu-west-1.acrcloud.com",
+    "host": "ap-southeast-1.api.acrcloud.com",
     "access_key": "409edc00cbff342f0960a6e82d872028",
     "access_secret": "3ETYsb5Aud9wZ2KoiFH2rZgk1ZYT2Fv9Xj42phnk",
 }
@@ -35,12 +35,13 @@ def sign_request(secret: str, method: str, uri: str, access_key: str, data_type:
     ).decode('ascii')
 
 
-def get_apple_music_link(metadata: dict) -> str:
+def get_external_link(metadata: dict, service: str) -> str:
     try:
-        if metadata.get("spotify"):
-            return metadata["spotify"].get("external_urls", {}).get("spotify", "")
-        if metadata.get("apple_music"):
-            return metadata["apple_music"].get("url", "")
+        ext = metadata.get("external_metadata", {}).get(service, {})
+        if service == "spotify":
+            return ext.get("track", {}).get("external_urls", {}).get("spotify", "")
+        if service == "apple_music":
+            return ext.get("url", "")
         return ""
     except Exception:
         return ""
@@ -50,6 +51,7 @@ def get_apple_music_link(metadata: dict) -> str:
 async def recognize_song(file: UploadFile = File(...)):
     try:
         audio_data = await file.read()
+        print(f"Received audio file: {file.filename}, size: {len(audio_data)} bytes")
         
         timestamp = str(int(time.time()))
         signature = sign_request(
@@ -62,10 +64,16 @@ async def recognize_song(file: UploadFile = File(...)):
             timestamp
         )
         
+        # Usar el host correcto
+        url = f"https://{ACR_CONFIG['host']}/v1/identify"
+        print(f"Making request to: {url}")
+        
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                f"https://{ACR_CONFIG['host']}/v1/identify",
-                files={"sample": (file.filename, audio_data, "audio/webm")},
+                url,
+                files={
+                    "sample": (file.filename or "audio.webm", audio_data, "audio/webm")
+                },
                 data={
                     "access_key": ACR_CONFIG["access_key"],
                     "sample_bytes": len(audio_data),
@@ -77,10 +85,13 @@ async def recognize_song(file: UploadFile = File(...)):
                 timeout=30.0
             )
         
+        print(f"Response status: {response.status_code}")
         result = response.json()
+        print(f"Response: {json.dumps(result)[:500]}")
         
         if result.get("status", {}).get("code") != 0:
-            return {"success": False, "message": "No song recognized"}
+            msg = result.get("status", {}).get("msg", "No song recognized")
+            return {"success": False, "message": msg}
         
         metadata = result["metadata"]["music"][0]
         
@@ -90,12 +101,15 @@ async def recognize_song(file: UploadFile = File(...)):
             "album": metadata.get("album", {}).get("name", ""),
             "year": metadata.get("release_date", "")[:4] if metadata.get("release_date") else "",
             "cover_url": metadata.get("album", {}).get("images", [{}])[0].get("url", ""),
-            "apple_music_link": get_apple_music_link(metadata.get("external_metadata", {})),
+            "apple_music_link": get_external_link(metadata, "apple_music"),
         }
         
         return {"success": True, "song": song_info}
         
     except Exception as e:
+        import traceback
+        print(f"Error: {e}")
+        traceback.print_exc()
         return {"success": False, "message": str(e)}
 
 
